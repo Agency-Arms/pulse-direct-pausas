@@ -8,12 +8,32 @@ const LOTE = 500;
 
 export function criarEstado(sql) {
   const abertos = sql.array(ABERTOS);
+  // A coluna atendente_anterior veio depois: até alguém rodar o db/distribuicao.sql de novo, segue sem ela.
+  let temAnterior = null;
+  const conferirAnterior = async () => {
+    if (temAnterior === null) {
+      const [r] = await sql`SELECT EXISTS (SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'dist_conversas' AND column_name = 'atendente_anterior') AS ok`;
+      temAnterior = r.ok;
+    }
+    return temAnterior;
+  };
 
   return {
     /** As tabelas existem? Se não, tenta criá-las (funciona quando o usuário do banco tem permissão). */
     async preparar() {
       const [r] = await sql`SELECT to_regclass('dist_estado') IS NOT NULL AS ok`;
-      if (r.ok) return { ok: true };
+      if (r.ok) {
+        if (!(await conferirAnterior())) {
+          try {
+            await sql`ALTER TABLE dist_conversas ADD COLUMN IF NOT EXISTS atendente_anterior text`;
+            temAnterior = true;
+          } catch {
+            // sem permissão: os concluídos via transferência (ex.: robô de NPS) só passam a contar depois do db/distribuicao.sql
+          }
+        }
+        return { ok: true };
+      }
       try {
         await sql.unsafe(readFileSync(new URL('../../db/distribuicao.sql', import.meta.url), 'utf8'));
         return { ok: true, criado: true };
@@ -66,17 +86,29 @@ export function criarEstado(sql) {
      * `leitura` marca as vistas numa releitura completa. Descarta o que não interessa mais.
      */
     async aplicarConversas(lista, { inicioDia, leitura = null }) {
+      const anterior = await conferirAnterior();
       for (let i = 0; i < lista.length; i += LOTE) {
         const linhas = lista.slice(i, i + LOTE).map((c) => ({
           id: c.id, status: c.status, equipe_id: c.equipeId, user_id: c.userId, criada_em: c.criadaEm,
           alterada_us: c.alteradaUs ?? 0, encerrada_em: c.encerradaEm, tipo: c.tipo, leitura,
         }));
-        await sql`INSERT INTO dist_conversas ${sql(linhas, 'id', 'status', 'equipe_id', 'user_id', 'criada_em', 'alterada_us', 'encerrada_em', 'tipo', 'leitura')}
+        const colunas = ['id', 'status', 'equipe_id', 'user_id', 'criada_em', 'alterada_us', 'encerrada_em', 'tipo', 'leitura'];
+        // atendente_anterior: a conversa saiu do atendente para OUTRA equipe sem ninguém (ex.: "concluir" nas
+        // filas PRONTO transfere para o robô CHATBOT NPS, que conclui depois). O concluído conta para ele.
+        // Sem atendente na MESMA equipe (devolução à fila / equalização) não conta para ninguém.
+        const regraAnterior = anterior ? sql`, atendente_anterior = CASE
+              WHEN excluded.user_id IS NOT NULL THEN NULL
+              WHEN excluded.equipe_id IS DISTINCT FROM dist_conversas.equipe_id
+                THEN COALESCE(dist_conversas.user_id, dist_conversas.atendente_anterior)
+              WHEN dist_conversas.user_id IS NOT NULL THEN NULL
+              ELSE dist_conversas.atendente_anterior END` : sql``;
+        await sql`INSERT INTO dist_conversas ${sql(linhas, ...colunas)}
           ON CONFLICT (id) DO UPDATE SET
             status = excluded.status, equipe_id = excluded.equipe_id, user_id = excluded.user_id,
             criada_em = COALESCE(excluded.criada_em, dist_conversas.criada_em), alterada_us = excluded.alterada_us,
             encerrada_em = excluded.encerrada_em, tipo = excluded.tipo,
             leitura = COALESCE(excluded.leitura, dist_conversas.leitura)
+            ${regraAnterior}
           WHERE dist_conversas.alterada_us <= excluded.alterada_us`;
         const ids = sql.array(linhas.map((l) => l.id));
         await sql`DELETE FROM dist_conversas WHERE id = ANY(${ids})
@@ -126,9 +158,11 @@ export function criarEstado(sql) {
         WHERE status = 'PENDING' AND user_id IS NULL AND equipe_id IS NOT NULL AND tipo IS DISTINCT FROM 'GROUP'`;
     },
 
-    concluidasHoje(inicioDia) {
-      return sql`SELECT user_id, count(*)::int AS n FROM dist_conversas
-        WHERE status = 'COMPLETED' AND encerrada_em >= ${inicioDia} AND user_id IS NOT NULL GROUP BY 1`;
+    /** Por atendente: quem concluiu, ou quem estava com ela antes de ir para outra equipe (ex.: robô de NPS). */
+    async concluidasHoje(inicioDia) {
+      const dono = (await conferirAnterior()) ? sql`COALESCE(user_id, atendente_anterior)` : sql`user_id`;
+      return sql`SELECT ${dono} AS user_id, count(*)::int AS n FROM dist_conversas
+        WHERE status = 'COMPLETED' AND encerrada_em >= ${inicioDia} AND ${dono} IS NOT NULL GROUP BY 1`;
     },
 
     async ausentes(leitura, limite) {

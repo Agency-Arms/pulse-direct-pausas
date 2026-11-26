@@ -13,6 +13,10 @@ create table if not exists pausas.dist_conversas (
   tipo          text,
   leitura       integer                    -- rodada da última leitura completa que viu a conversa
 );
+-- Quem estava com a conversa quando ela saiu do atendente por transferência para outra equipe
+-- (ex.: "concluir" nas filas PRONTO manda a conversa para o robô CHATBOT NPS, sem atendente, e é o
+-- robô que conclui). Sem isto o concluído não contava para ninguém.
+alter table pausas.dist_conversas add column if not exists atendente_anterior text;
 create index if not exists dist_conversas_dono on pausas.dist_conversas (user_id) where status in ('STARTED', 'PENDING', 'IN_PROGRESS');
 create index if not exists dist_conversas_fila on pausas.dist_conversas (equipe_id) where status = 'PENDING' and user_id is null;
 create index if not exists dist_conversas_concluidas on pausas.dist_conversas (encerrada_em) where status = 'COMPLETED';

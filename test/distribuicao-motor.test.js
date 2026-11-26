@@ -450,6 +450,33 @@ caso('auto-manutenção: mudanças no Pulse Direct aparecem no registro e valem 
   }
 });
 
+caso('concluídos hoje: "concluir" que transfere para o robô de NPS (sem atendente) conta para quem atendia', async () => {
+  const c = await cenario({ configurar: (p) => { base(p); p.equipe('NPS', 'CHATBOT NPS'); } });
+  try {
+    await c.d.ciclo({ origem: 'manual' });
+    const daAna = [...c.pulse.conversas.values()].filter((x) => x.userId === 'ana' && x.status === 'IN_PROGRESS');
+    const daBia = [...c.pulse.conversas.values()].filter((x) => x.userId === 'bia' && x.status === 'IN_PROGRESS');
+    // Ana conclui 3: vão para o robô de NPS sem atendente (pendentes); o robô conclui 2 delas
+    for (const x of daAna.slice(0, 3)) c.pulse.mudar(x, { departmentId: 'NPS', userId: null, status: 'PENDING' });
+    // Bia: 1 concluída direto por ela; 1 devolvida à fila da própria equipe (não é produção de ninguém)
+    c.pulse.mudar(daBia[0], { status: 'COMPLETED', endAt: c.pulse.agora() });
+    c.pulse.mudar(daBia[1], { userId: null, status: 'PENDING' });
+    c.pulse.relogio += 1_000;
+    await c.d.ciclo({ origem: 'manual' });
+    c.pulse.relogio += 11_000;
+    for (const x of daAna.slice(0, 2)) c.pulse.mudar(x, { status: 'COMPLETED', endAt: c.pulse.agora() });
+    c.pulse.mudar(daBia[1], { status: 'COMPLETED', endAt: c.pulse.agora() });
+    await c.d.ciclo({ origem: 'manual' });
+    const p = await c.d.painel();
+    const ana = p.atendentes.find((a) => a.userId === 'ana');
+    const bia = p.atendentes.find((a) => a.userId === 'bia');
+    assert.equal(ana.concluidasHoje, 2, 'as 2 que o robô concluiu contam para a Ana; a pendente no NPS ainda não');
+    assert.equal(bia.concluidasHoje, 1, 'a devolvida à fila e concluída sem atendente não conta para a Bia');
+  } finally {
+    await c.fechar();
+  }
+});
+
 caso('painel: abertos por equipe (inclusive de equipe da qual não é atendente), vagas e concluídos hoje', async () => {
   const c = await cenario({
     configurar: (p) => {
